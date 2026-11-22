@@ -12,13 +12,75 @@
 * 异常：输入非法（hop 非正、采样率非正、样本非有限、BPM 范围非法、
   样本过短等）统一抛 :class:`AnalysisError`；:func:`validate` 例外，
   它返回问题列表而不抛异常。
-
-本模块初始为练习桩：8 个函数全部抛出 ``NotImplementedError``，等待实现。
 """
+
+import math
 
 
 class AnalysisError(ValueError):
     """BPM/调性分析参数或音频非法时抛出的异常。"""
+
+
+# ---------------------------------------------------------------------------
+# 内部校验与常量
+# ---------------------------------------------------------------------------
+
+# Krumhansl–Kessler 自然小调音级模板，索引 0 为小调主音。
+_KK_MINOR_PROFILE = [
+    6.33,
+    2.68,
+    3.52,
+    5.38,
+    2.60,
+    3.53,
+    2.54,
+    4.75,
+    3.98,
+    2.69,
+    3.34,
+    3.17,
+]
+
+_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+# 科学音高记谱中的 C0（约 16.35 Hz），色度折叠的参考频率。
+_C0_FREQ = 16.351597831287414  # 440 * 2 ** (-57 / 12)
+
+
+def _is_real_number(value):
+    """布尔值不算数值；int/float 且非 NaN/Inf 才是有限实数。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _validate_positive_int(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise AnalysisError(f"{name} must be a positive integer, got {value!r}")
+
+
+def _validate_positive_rate(value, name):
+    if not _is_real_number(value) or value <= 0:
+        raise AnalysisError(f"{name} must be a finite positive number, got {value!r}")
+
+
+def _check_bpm_range(bpm_range):
+    if not isinstance(bpm_range, (tuple, list)) or len(bpm_range) != 2:
+        raise AnalysisError(f"invalid bpm range: {bpm_range!r}")
+    low, high = bpm_range
+    if not (_is_real_number(low) and _is_real_number(high)) or low <= 0 or low >= high:
+        raise AnalysisError(f"invalid bpm range: {low}, {high}")
+    return float(low), float(high)
+
+
+def _validate_samples(samples):
+    for index, value in enumerate(samples):
+        if not _is_real_number(value):
+            raise AnalysisError(f"non-finite sample at index {index}: {value}")
+
+
+def _validate_env(env):
+    for index, value in enumerate(env):
+        if not _is_real_number(value) or value < 0:
+            raise AnalysisError(f"non-finite or negative envelope at index {index}: {value}")
 
 
 def onset_envelope(
@@ -47,8 +109,33 @@ def onset_envelope(
         信号返回同长度的全 0 列表；``samples`` 为空时返回 ``[]``。
         未归一化的能量差分会把响度当成节拍强度，导致 BPM 偏高。
     """
+    _validate_positive_int(hop, "hop")
+    _validate_positive_rate(sample_rate, "sample_rate")
+    if not samples:
+        return []
+    _validate_samples(samples)
 
-    raise NotImplementedError("onset_envelope 尚未实现")
+    n_frames = len(samples) // hop
+    energies = []
+    for frame in range(n_frames):
+        start = frame * hop
+        frame_samples = samples[start:start + hop]
+        mean_energy = sum(value * value for value in frame_samples) / hop
+        energies.append(mean_energy)
+
+    # 第一帧与 0 能量比较，因此首帧也可能产生正差分。
+    diffs = [max(0.0, energies[0])]
+    diffs.extend(
+        max(0.0, energies[index] - energies[index - 1])
+        for index in range(1, n_frames)
+    )
+
+    peak = max(diffs)
+    if peak <= 0.0:
+        # 全零/静音信号：同长度全 0。
+        return [0.0] * n_frames
+    # 归一化：最大值严格为 1.0，响度差异不再影响节拍强度。
+    return [value / peak for value in diffs]
 
 
 def autocorr_tempo(
@@ -83,8 +170,38 @@ def autocorr_tempo(
         则钳制到最近的边界。对规则的 120 BPM 节拍信号，结果与 120
         的误差不得超过 0.5 BPM。
     """
+    _validate_positive_int(hop, "hop")
+    _validate_positive_rate(sample_rate, "sample_rate")
+    low, high = _check_bpm_range(bpm_range)
+    _validate_env(env)
+    if len(env) < 2 or not any(value > 0.0 for value in env):
+        raise AnalysisError("envelope must contain at least 2 frames and be non-silent")
 
-    raise NotImplementedError("autocorr_tempo 尚未实现")
+    n = len(env)
+    # lag 与 BPM 的换算：bpm = 60 * sample_rate / (lag * hop)，
+    # 因此 lag 与 bpm 成反比：lag 越小 bpm 越高。
+    min_lag = max(1, math.floor(60.0 * sample_rate / (high * hop)))
+    max_lag = min(n - 1, math.ceil(60.0 * sample_rate / (low * hop)))
+    if min_lag > max_lag:
+        # 包络短到连一个候选 lag 都没有：钳制到最近边界。
+        return min(max(60.0 * sample_rate / hop, low), high)
+
+    best_lag = min_lag
+    best_score = -math.inf
+    for lag in range(min_lag, max_lag + 1):
+        overlap = n - lag
+        # 按重叠长度归一，避免重叠更长的小 lag 系统性胜出。
+        score = (
+            sum(env[index] * env[index + lag] for index in range(overlap))
+            / overlap
+        )
+        if score > best_score:
+            best_score = score
+            best_lag = lag
+
+    bpm = 60.0 * sample_rate / (best_lag * hop)
+    # 范围外钳制到最近边界。
+    return min(max(bpm, low), high)
 
 
 def score_pulse(
@@ -113,8 +230,31 @@ def score_pulse(
         多少能量”而不是只对节拍点取平均，因此 120 BPM 网格应比
         60 BPM 网格覆盖更多 120 BPM 的脉冲能量。
     """
+    _validate_positive_int(hop, "hop")
+    _validate_positive_rate(sample_rate, "sample_rate")
+    if not _is_real_number(bpm) or bpm <= 0:
+        raise AnalysisError(f"bpm must be a finite positive number, got {bpm!r}")
+    _validate_env(env)
 
-    raise NotImplementedError("score_pulse 尚未实现")
+    total = sum(env)
+    if not env or total <= 0.0:
+        return 0.0
+
+    n = len(env)
+    period_seconds = 60.0 / bpm
+    covered_frames = set()
+    beat = 0
+    while True:
+        frame = int(round(beat * period_seconds * sample_rate / hop))
+        if frame >= n:
+            break
+        if 0 <= frame < n:
+            covered_frames.add(frame)
+        beat += 1
+
+    covered_energy = sum(env[frame] for frame in covered_frames)
+    score = covered_energy / total
+    return min(max(score, 0.0), 1.0)
 
 
 def chroma_vector(
@@ -141,8 +281,57 @@ def chroma_vector(
         音级，并汇总该音级及八度等价频率的能量；不能只用全频带平均
         能量，否则不同音高的调性会变成随机结果。
     """
+    _validate_positive_rate(sample_rate, "sample_rate")
+    _validate_positive_int(n_bands, "n_bands")
+    if not samples:
+        return []
+    _validate_samples(samples)
 
-    raise NotImplementedError("chroma_vector 尚未实现")
+    n = len(samples)
+    nyquist = sample_rate / 2.0
+    chroma = [0.0] * n_bands
+
+    # 仅标准库可用：对每个八度等价音级的中心频率（MIDI 音高）做
+    # Goertzel 单频 DFT，把功率汇总到对应色度 bin。
+    # MIDI 69 = A4 = 440 Hz；覆盖钢琴音域 MIDI 24..108。
+    for midi in range(24, 109):
+        freq = 440.0 * (2.0 ** ((midi - 69) / 12.0))
+        if freq >= nyquist:
+            continue
+        omega = 2.0 * math.pi * freq / sample_rate
+        coeff = 2.0 * math.cos(omega)
+        prev_1 = 0.0
+        prev_2 = 0.0
+        for value in samples:
+            current = value + coeff * prev_1 - prev_2
+            prev_2 = prev_1
+            prev_1 = current
+        power = prev_1 * prev_1 + prev_2 * prev_2 - coeff * prev_1 * prev_2
+        if power <= 0.0:
+            continue
+        # 按 n_bands * log2(freq / C0) 折叠到八度内音级。
+        band = int(round(n_bands * math.log2(freq / _C0_FREQ))) % n_bands
+        chroma[band] += power
+
+    peak = max(chroma)
+    if peak <= 0.0:
+        # 静音信号：全 0。
+        return [0.0] * n_bands
+    return [value / peak for value in chroma]
+
+
+def _pearson_correlation(x, y):
+    """两个等长序列的皮尔逊相关系数；零方差时返回 0。"""
+    n = len(x)
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    numerator = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
+    var_x = sum((value - mean_x) ** 2 for value in x)
+    var_y = sum((value - mean_y) ** 2 for value in y)
+    denominator = math.sqrt(var_x * var_y)
+    if denominator <= 0.0:
+        return 0.0
+    return numerator / denominator
 
 
 def detect_key(chroma: list[float], major_profile: list[float]) -> tuple:
@@ -169,8 +358,38 @@ def detect_key(chroma: list[float], major_profile: list[float]) -> tuple:
 
     非法长度、非有限值或全零模板抛 :class:`AnalysisError`。
     """
+    if not isinstance(chroma, (list, tuple)) or len(chroma) != 12:
+        raise AnalysisError("chroma must be a length-12 vector")
+    if not isinstance(major_profile, (list, tuple)) or len(major_profile) != 12:
+        raise AnalysisError("major_profile must be a length-12 vector")
+    if any(not _is_real_number(value) for value in chroma):
+        raise AnalysisError("chroma contains non-finite values")
+    if any(not _is_real_number(value) or value < 0 for value in major_profile):
+        raise AnalysisError("major_profile values must be finite and non-negative")
+    if not any(value > 0.0 for value in major_profile):
+        raise AnalysisError("major_profile must not be all zeros")
 
-    raise NotImplementedError("detect_key 尚未实现")
+    candidates = []
+    for root in range(12):
+        rotated_major = [major_profile[(degree - root) % 12] for degree in range(12)]
+        rotated_minor = [_KK_MINOR_PROFILE[(degree - root) % 12] for degree in range(12)]
+        candidates.append((
+            _pearson_correlation(chroma, rotated_major),
+            f"{_NOTE_NAMES[root]} major",
+        ))
+        candidates.append((
+            _pearson_correlation(chroma, rotated_minor),
+            f"{_NOTE_NAMES[root]} minor",
+        ))
+
+    # 确定性排序：分数降序，分数相同按调性名稳定排序。
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    best_score, best_name = candidates[0]
+    second_score = candidates[1][0]
+
+    # 置信度：最佳与次佳的相关系数差距，clip 到 0..1。
+    confidence = min(max(best_score - second_score, 0.0), 1.0)
+    return best_name, confidence
 
 
 def half_double_fix(bpm: float, prior: float) -> float:
@@ -194,8 +413,21 @@ def half_double_fix(bpm: float, prior: float) -> float:
 
     ``bpm <= 0``、``prior <= 0`` 或非有限值抛 :class:`AnalysisError`。
     """
+    if not _is_real_number(bpm) or bpm <= 0:
+        raise AnalysisError(f"bpm must be a finite positive number, got {bpm!r}")
+    if not _is_real_number(prior) or prior <= 0:
+        raise AnalysisError(f"prior must be a finite positive number, got {prior!r}")
 
-    raise NotImplementedError("half_double_fix 尚未实现")
+    # 原 bpm 放在首位：距离相同时优先返回原 bpm，保证确定性。
+    candidates = [bpm, 2.0 * bpm, bpm / 2.0]
+    best = candidates[0]
+    best_distance = abs(best - prior)
+    for candidate in candidates[1:]:
+        distance = abs(candidate - prior)
+        if distance < best_distance:
+            best_distance = distance
+            best = candidate
+    return best
 
 
 def validate(samples: list[float], bpm_range: tuple) -> list[str]:
@@ -224,8 +456,33 @@ def validate(samples: list[float], bpm_range: tuple) -> list[str]:
         先检查范围，再检查长度，最后按索引逐样本检查。本函数不修改
         输入，也不通过抛 :class:`AnalysisError` 表示这些内容问题。
     """
+    problems = []
 
-    raise NotImplementedError("validate 尚未实现")
+    # 1) 先检查范围。
+    if not isinstance(bpm_range, (tuple, list)) or len(bpm_range) != 2:
+        problems.append(f"invalid bpm range: {bpm_range}, {bpm_range}")
+        low, high = bpm_range, bpm_range
+    else:
+        low, high = bpm_range
+        if (
+            not _is_real_number(low)
+            or not _is_real_number(high)
+            or low <= 0
+            or low >= high
+        ):
+            problems.append(f"invalid bpm range: {low}, {high}")
+
+    # 2) 再检查长度。
+    if len(samples) < 2:
+        problems.append(f"too short samples: {len(samples)}")
+        return problems
+
+    # 3) 最后按索引逐样本检查。
+    for index, value in enumerate(samples):
+        if not _is_real_number(value):
+            problems.append(f"non-finite sample at index {index}: {value}")
+
+    return problems
 
 
 def analyze_batch(tracks: list, config: dict) -> dict:
@@ -271,5 +528,77 @@ def analyze_batch(tracks: list, config: dict) -> dict:
     ``tracks`` 返回
     ``{"results": [], "ids": [], "total_tracks": 0}``。
     """
+    if not isinstance(config, dict):
+        raise AnalysisError("config must be a dict")
 
-    raise NotImplementedError("analyze_batch 尚未实现")
+    required = ("hop", "bpm_range", "n_bands", "major_profile", "prior_bpm")
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise AnalysisError(f"missing config fields: {', '.join(missing)}")
+
+    hop = config["hop"]
+    bpm_range = config["bpm_range"]
+    n_bands = config["n_bands"]
+    major_profile = config["major_profile"]
+    prior_bpm = config["prior_bpm"]
+
+    # 配置整体校验（任一非法即整体失败）。
+    _validate_positive_int(hop, "hop")
+    low, high = _check_bpm_range(bpm_range)
+    _validate_positive_int(n_bands, "n_bands")
+    if not isinstance(major_profile, (list, tuple)) or len(major_profile) != 12:
+        raise AnalysisError("major_profile must be a length-12 vector")
+    if any(not _is_real_number(value) or value < 0 for value in major_profile):
+        raise AnalysisError("major_profile values must be finite and non-negative")
+    if not any(value > 0.0 for value in major_profile):
+        raise AnalysisError("major_profile must not be all zeros")
+    if prior_bpm is not None and (not _is_real_number(prior_bpm) or prior_bpm <= 0):
+        raise AnalysisError(
+            f"prior_bpm must be None or a finite positive number, got {prior_bpm!r}"
+        )
+    if not isinstance(tracks, list):
+        raise AnalysisError("tracks must be a list")
+
+    # 先校验所有轨道：任一轨非法就整体回滚，不进入计算阶段。
+    for track in tracks:
+        if not isinstance(track, dict):
+            raise AnalysisError("each track must be a dict")
+        if not isinstance(track.get("id"), str) or not track["id"]:
+            raise AnalysisError("track id must be a non-empty string")
+        sample_rate = track.get("sample_rate")
+        if not _is_real_number(sample_rate) or sample_rate <= 0:
+            raise AnalysisError(
+                f"track {track.get('id')!r} has invalid sample_rate: {sample_rate!r}"
+            )
+        samples = track.get("samples")
+        if not isinstance(samples, list):
+            raise AnalysisError(f"track {track['id']!r} samples must be a list")
+        if validate(samples, bpm_range):
+            raise AnalysisError(
+                f"track {track['id']!r} failed validation: "
+                f"{validate(samples, bpm_range)}"
+            )
+
+    if not tracks:
+        return {"results": [], "ids": [], "total_tracks": 0}
+
+    results = []
+    ids = []
+    for track in tracks:
+        # 每轨使用独立的局部变量计算包络，杜绝跨轨复用中间状态。
+        env = onset_envelope(track["samples"], hop, track["sample_rate"])
+        bpm = autocorr_tempo(env, hop, track["sample_rate"], bpm_range)
+        if prior_bpm is not None:
+            bpm = half_double_fix(bpm, prior_bpm)
+            # half_double_fix 不做范围钳制，由调用者保证落回范围。
+            bpm = min(max(bpm, low), high)
+        chroma = chroma_vector(track["samples"], track["sample_rate"], n_bands)
+        key, confidence = detect_key(chroma, major_profile)
+        confidence = min(max(confidence, 0.0), 1.0)
+
+        results.append(
+            {"id": track["id"], "bpm": bpm, "key": key, "confidence": confidence}
+        )
+        ids.append(track["id"])
+
+    return {"results": results, "ids": ids, "total_tracks": len(tracks)}
